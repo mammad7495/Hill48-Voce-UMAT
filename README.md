@@ -20,16 +20,7 @@ $$\sigma_y(\alpha) = \sigma_{Y0} + Q_\infty \left(1 - e^{-b\alpha}\right)$$
 
 where $\alpha$ is the equivalent plastic strain, $\sigma_{Y0}$ is the initial yield stress, $Q_\infty$ is the saturation stress increment, and $b$ controls the hardening rate.
 
-## Files
-
-| File | Description |
-|------|-------------|
-| `Hill48.f` | Standalone Abaqus UMAT (self-contained, no external modules) |
-| `HillPlasticity_GRR.f90` | Subroutine version for use within multi-phase ROM frameworks |
-
 ## Material Properties
-
-### `Hill48.f` (Standalone UMAT)
 
 | PROPS Index | Parameter | Description |
 |:-----------:|-----------|-------------|
@@ -45,25 +36,7 @@ where $\alpha$ is the equivalent plastic strain, $\sigma_{Y0}$ is the initial yi
 | 10 | M | Hill48 parameter |
 | 11 | N | Hill48 parameter |
 
-### `HillPlasticity_GRR.f90` (ROM Subroutine)
-
-| PROPS Index | Parameter | Description |
-|:-----------:|-----------|-------------|
-| 1 | E | Young's modulus |
-| 2 | nu | Poisson's ratio |
-| 3 | F | Hill48 parameter |
-| 4 | G | Hill48 parameter |
-| 5 | H | Hill48 parameter |
-| 6 | L | Hill48 parameter |
-| 7 | M | Hill48 parameter |
-| 8 | N | Hill48 parameter |
-| 9 | SY0 | Initial yield stress |
-| 10 | QINF | Voce saturation stress increment |
-| 11 | BVOCE | Voce hardening rate |
-
 ## State Variables
-
-### `Hill48.f`
 
 | STATEV Index | Variable |
 |:------------:|----------|
@@ -71,14 +44,6 @@ where $\alpha$ is the equivalent plastic strain, $\sigma_{Y0}$ is the initial yi
 | 2 | Current yield stress |
 | 3-8 | Plastic strain tensor (11, 22, 33, 12, 13, 23) |
 | 9 | Convergence flag (0 = converged, 1 = failed) |
-
-### `HillPlasticity_GRR.f90`
-
-| STATEV Index | Variable |
-|:------------:|----------|
-| 1-6 | Plastic strain components |
-| 7 | Equivalent plastic strain (alpha) |
-| 8 | Current yield stress |
 
 ## Usage in Abaqus
 
