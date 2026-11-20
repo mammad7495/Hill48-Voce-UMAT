@@ -41,14 +41,14 @@ SUBROUTINE UMAT(STRESS, STATEV, DDSDDE, SSE, SPD, SCD, RPL,           &
                 TEMP, DTEMP, PREDEF, DPRED, CMNAME, NDI, NSHR, NTENS, &
                 NSTATV, PROPS, NPROPS, COORDS, DROT, PNEWDT,          &
                 CELENT, DFGRD0, DFGRD1, NOEL, NPT, LAYER, KSPT,       &
-                KSTEP, KINC)
+                JSTEP, KINC)
 
     IMPLICIT NONE
 
     ! Abaqus UMAT interface variables
     CHARACTER*80 CMNAME
     INTEGER NDI, NSHR, NTENS, NSTATV, NPROPS
-    INTEGER NOEL, NPT, LAYER, KSPT, KSTEP, KINC
+    INTEGER NOEL, NPT, LAYER, KSPT, JSTEP(4), KINC
 
     REAL(8) STRESS(NTENS), STATEV(NSTATV), DDSDDE(NTENS,NTENS)
     REAL(8) SSE, SPD, SCD, RPL, DRPLDT, DTIME, TEMP, DTEMP, PNEWDT, CELENT
@@ -56,278 +56,496 @@ SUBROUTINE UMAT(STRESS, STATEV, DDSDDE, SSE, SPD, SCD, RPL,           &
     REAL(8) PROPS(NPROPS), COORDS(3), DROT(3,3), DFGRD0(3,3), DFGRD1(3,3)
     REAL(8) DDSDDT(NTENS), DRPLDE(NTENS)
 
-    ! Local variables for plasticity computation
-    REAL(8) :: alpha_tr, alpha, StressYield, s_y, s_y_D, s_y_tr, f_gamma_tr
-    REAL(8) :: Sigma_Y0, Q_inf, b_voce
-    REAL(8) :: MatM(6,6), MatD(6,6), MatI(6,6)
-    REAL(8) :: MatM_copy(6,6), Mat_inv(6,6)
-    REAL(8) :: W(6), Q(6,6), Gamma(6,6), K(6,6), dK_dDelta_gamma_matrix(6,6)
-    REAL(8) :: s_tr(6), strain_p(6), Stress_New(6), s_tilde_tr(6)
-    REAL(8) :: Vec(6), dev_corrected(6)
-    REAL(8) :: E, XNUE, EBULK3, EG2, EG, ELAM
-    REAL(8) :: HillF, HillG, HillH, HillL, HillM, HillN
-    REAL(8) :: pressure, d_ga, omega, d_al, f_gamma_delta, delta_alpha
-    REAL(8) :: Df_gamma_d_d_gamma, d_omega_d_d_gamma, d_sy_d_d_gamma
-    REAL(8) :: TOLERANCE, exp_term
-    INTEGER :: iteration, K3, K5, K6, K7, K8, INFO
-    LOGICAL :: converged
 
-    ! Extract material properties
-    E = PROPS(1)              ! Young's modulus
-    XNUE = PROPS(2)           ! Poisson's ratio
-    Sigma_Y0 = PROPS(3)       ! Initial yield stress
-    Q_inf = PROPS(4)          ! Saturation stress (Q∞)
-    b_voce = PROPS(5)         ! Voce hardening rate parameter
-    HillF = PROPS(6)          ! Hill parameter F
-    HillG = PROPS(7)          ! Hill parameter G
-    HillH = PROPS(8)          ! Hill parameter H
-    HillL = PROPS(9)          ! Hill parameter L
-    HillM = PROPS(10)         ! Hill parameter M
-    HillN = PROPS(11)         ! Hill parameter N
+    real(8) :: phase_state(8), trial_stress(6)
+    logical :: success
 
-    ! Initialize state variables
-    IF (TIME(2) < 1.0D-6) THEN
-        alpha_tr = 0.0D0
-        ! Voce: σ_y0 = σ_Y0 + Q∞(1 - e^0) = σ_Y0
-        StressYield = Sigma_Y0
-        strain_p = 0.0D0
-    ELSE
-        alpha_tr = STATEV(1)
-        StressYield = STATEV(2)
-        strain_p(1:6) = STATEV(3:8)
-    END IF
+    if (NSTATV < 9) then
+        write(*,*) 'Hill48 UMAT requires at least nine state variables.'
+        call XIT
+        return
+    end if
+    if (NDI /= 3 .or. NSHR /= 3 .or. NTENS /= 6 .or. NPROPS /= 11) then
+        write(*,*) 'Hill48 UMAT requires a 3D stress state and 11 properties.'
+        call XIT
+        return
+    end if
 
-    ! Create elasticity matrix
-    EBULK3 = E/(1.0D0-2.0D0*XNUE)
-    EG2 = E/(1.0D0+XNUE)
-    EG = EG2/2.0D0
-    ELAM = (EBULK3-EG2)/3.0D0
+    phase_state(1:6) = STATEV(3:8)
+    phase_state(7:8) = STATEV(1:2)
+    trial_stress = STRESS
 
-    MatD = 0.0D0
-    MatD(1:3,1:3) = ELAM
-    DO K3 = 1, 3
-        MatD(K3,K3) = EG2 + ELAM
-    END DO
-    DO K3 = 4, 6
-    MatD(K3, K3) = EG
-    END DO
+    call hill48_update(trial_stress, DDSDDE, DSTRAN, PROPS, phase_state, success)
+    STATEV(9) = 0.0d0
+    if (.not. success) then
+        STATEV(9) = 1.0d0
+        PNEWDT = min(PNEWDT, 0.5d0)
+        return
+    end if
 
-    ! Create Hill anisotropy matrix
-    MatM = 0.0D0
-    MatM(1,1) = HillG + HillH
-    MatM(2,2) = HillF + HillH
-    MatM(3,3) = HillF + HillG
-    MatM(1,2) = -HillH
-    MatM(1,3) = -HillG
-    MatM(2,3) = -HillF
-    MatM(2,1) = MatM(1,2)
-    MatM(3,1) = MatM(1,3)
-    MatM(3,2) = MatM(2,3)
-    MatM(4,4) = 2.0D0*HillN
-    MatM(5,5) = 2.0D0*HillM
-    MatM(6,6) = 2.0D0*HillL
+    STRESS = trial_stress
+    STATEV(1:2) = phase_state(7:8)
+    STATEV(3:8) = phase_state(1:6)
 
-    ! Identity matrix
-    MatI = 0.0D0
-    DO K5 = 1, 6
-        MatI(K5,K5) = 1.0D0
-    END DO
+contains
 
-    ! Elastic stiffness used as an approximate material Jacobian.
-    DDSDDE = MatD
-    STATEV(9) = 0.0D0
+subroutine hill48_update(stress, ddsdde, dstran, props, statev, success)
+implicit none
+real(8), intent(inout) :: stress(6), statev(8)
+real(8), intent(out) :: ddsdde(6,6)
+real(8), intent(in) :: dstran(6), props(11)
+logical, intent(out) :: success
 
-    ! Compute trial stress (elastic predictor)
-    Vec = MATMUL(MatD, DSTRAN)
-    Stress_New = Vec + STRESS
-    s_tr = Stress_New
+!---- Local variables
+real(8) :: E, NU, XMU, XLAM
+real(8) :: F, G, H, XL, XM, XN, SY0, QINF, BVOCE
+real(8) :: AMAT(6,6), QMAT(6,6), GAMMA_EIG0(6,6), GAMMA_EIG(6)
+real(8) :: STRESS_TR(6), STRESS_DEV(6), STRESS_TILDE(6), STRESS_DEV_NEW(6)
+real(8) :: ALPHA_N, SY_TR, DSYDA, FY_TR, DGAMMA, ALPHA_NEW, SY_NEW
+real(8) :: KMAT(6), OMEGA, DOMEGA, DSY_DGAMMA, DFY, RESID, DENOM
+real(8) :: HYDRO, TEMP1(6), TEMP2(6), W(6), MatD(6,6), DSTRESS(6), SQRT2
+real(8), parameter :: TOL = 1.0D-8
+integer :: I, J, K, ITER, INFO
+integer, parameter :: MAXITER = 250
+logical :: PLASTIC
 
-    ! Extract deviatoric part
-    pressure = (Stress_New(1)+Stress_New(2)+Stress_New(3))/3.0D0
-    s_tr(1:3) = s_tr(1:3) - pressure
+!======================================================================
+!     Read material properties
+!======================================================================
+E     = props(1)
+NU    = props(2)
+F     = props(6)
+G     = props(7)
+H     = props(8)
+XL    = props(9)
+XM    = props(10)
+XN    = props(11)
+SY0   = props(3)
+QINF  = props(4)
+BVOCE = props(5)
 
-    ! Eigendecomposition of anisotropy tensor
-    MatM_copy = MatM
-    CALL compute_eigendecomposition(MatM_copy, W, Q, Gamma, INFO)
+XMU  = E / (2.0D0 * (1.0D0 + NU))
+XLAM = E * NU / ((1.0D0 + NU) * (1.0D0 - 2.0D0 * NU))
+SQRT2 = DSQRT(2.0D0)
 
-    IF (INFO /= 0) THEN
-        WRITE(*,*) 'Error in eigendecomposition, INFO = ', INFO
-        STATEV(9) = 1.0D0
-        PNEWDT = MIN(PNEWDT, 0.5D0)
-        RETURN
-    END IF
+!     Elastic stiffness
+MatD = 0.0D0
+do I = 1, 3
+    do J = 1, 3
+        MatD(I,J) = XLAM
+    end do
+    MatD(I,I) = XLAM + 2.0D0*XMU
+end do
+MatD(4,4) = XMU
+MatD(5,5) = XMU
+MatD(6,6) = XMU
 
-    ! Transform trial stress to eigenspace
-    s_tilde_tr = MATMUL(TRANSPOSE(Q), s_tr)
+success = .false.
+DDSDDE = MatD
+ALPHA_N = statev(7)
 
-    ! Initialize trial values
-    s_y_tr = StressYield
+!======================================================================
+!     Build Hill48 anisotropy tensor (Mandel notation)
+!======================================================================
+AMAT = 0.0D0
+AMAT(1,1) = G + H
+AMAT(2,2) = F + H
+AMAT(3,3) = F + G
+AMAT(1,2) = -H;  AMAT(2,1) = -H
+AMAT(1,3) = -G;  AMAT(3,1) = -G
+AMAT(2,3) = -F;  AMAT(3,2) = -F
+AMAT(4,4) = XN
+AMAT(5,5) = XM
+AMAT(6,6) = XL
 
-    ! Compute trial yield function
-    f_gamma_tr = 0.5D0 * DOT_PRODUCT(s_tilde_tr, MATMUL(Gamma, s_tilde_tr)) - s_y_tr**2
+!======================================================================
+!     Eigendecomposition: A = Q * GAMMA * Q^T
+!======================================================================
+call compute_eigen_GRR(AMAT, W, QMAT, GAMMA_EIG0, INFO)
+if (INFO /= 0) then
+    write(*,*) "Hill48 eigensolve failed, INFO =", INFO
+    return
+end if
+do I = 1, 6
+    GAMMA_EIG(I) = GAMMA_EIG0(I,I)
+end do
 
+!======================================================================
+!     Trial state
+!======================================================================
+call matvec6(MatD, dstran, DSTRESS)
+STRESS_TR = stress + DSTRESS
 
-    ! Check yield condition
-    IF (f_gamma_tr <= 0.0D0) THEN
-        ! Elastic step
-        STRESS = Stress_New
-        d_ga = 0.0D0
-        alpha = alpha_tr
-        s_y = StressYield
-    ELSE
-        ! Plastic step - Newton-Raphson iteration
-        tolerance = 5.0D-4
-        d_ga = 0.0D0
-        alpha = alpha_tr
-        converged = .FALSE.
+HYDRO = (STRESS_TR(1) + STRESS_TR(2) + STRESS_TR(3)) / 3.0D0
+STRESS_DEV(1:3) = STRESS_TR(1:3) - HYDRO
+STRESS_DEV(4:6) = STRESS_TR(4:6) * SQRT2  ! Mandel
 
-        DO iteration = 1, 250
-            ! Build K matrix (diagonal)
-            K = 0.0D0
-            DO K6 = 1, 6
-                K(K6,K6) = Gamma(K6,K6) / (1.0D0 + 2.0D0*EG*d_ga*Gamma(K6,K6))**2
-            END DO
+call matvec6_T(QMAT, STRESS_DEV, STRESS_TILDE)
 
-            ! Compute auxiliary variable omega
-            omega = SQRT(0.5D0 * DOT_PRODUCT(s_tilde_tr, MATMUL(K, s_tilde_tr)))
+call voce_hard(ALPHA_N, SY0, QINF, BVOCE, SY_TR, DSYDA)
 
-            IF (omega <= 1.0D-14) THEN
-                WRITE(*,*) 'Warning: omega is too small'
-                EXIT
-            END IF
+FY_TR = -SY_TR**2
+do I = 1, 6
+    FY_TR = FY_TR + 0.5D0 * GAMMA_EIG(I) * STRESS_TILDE(I)**2
+end do
 
-            ! Update alpha
-            delta_alpha = 2.0D0 * d_ga * omega
-            alpha = alpha_tr + delta_alpha
+!======================================================================
+!     Yield check and plastic correction
+!======================================================================
+if (FY_TR <= TOL) then
+    PLASTIC = .FALSE.
+    stress = STRESS_TR
+    DGAMMA = 0.0D0
+    ALPHA_NEW = ALPHA_N
+    SY_NEW = SY_TR
+else
+    PLASTIC = .TRUE.
+    DGAMMA = 0.0D0
+    ALPHA_NEW = ALPHA_N
 
-            ! ========================================================
-            ! VOCE HARDENING MODEL
-            ! σ_y = σ_Y0 + Q∞(1 - exp(-b·α))
-            ! ========================================================
-            exp_term = EXP(-b_voce * alpha)
-            s_y = Sigma_Y0 + Q_inf * (1.0D0 - exp_term)
+    do ITER = 1, MAXITER
+        do I = 1, 6
+            if (GAMMA_EIG(I) > 1.0D-12) then
+                KMAT(I) = GAMMA_EIG(I) / (1.0D0 + 2.0D0*XMU*DGAMMA*GAMMA_EIG(I))**2
+            else
+                KMAT(I) = 0.0D0
+            end if
+        end do
 
-            ! Derivative: ∂σ_y/∂α = Q∞·b·exp(-b·α)
-            s_y_D = Q_inf * b_voce * exp_term
-            ! ========================================================
+        OMEGA = 0.0D0
+        do I = 1, 6
+            OMEGA = OMEGA + 0.5D0 * KMAT(I) * STRESS_TILDE(I)**2
+        end do
+        OMEGA = DSQRT(MAX(OMEGA, 1.0D-30))
 
-            ! Compute residual function
-            f_gamma_delta = (s_y / omega) - 1.0D0
+        ALPHA_NEW = ALPHA_N + 2.0D0 * DGAMMA * OMEGA
+        call voce_hard(ALPHA_NEW, SY0, QINF, BVOCE, SY_NEW, DSYDA)
 
-            ! Check convergence
-            IF (ABS(f_gamma_delta) <= tolerance) THEN
-                StressYield = s_y
-                converged = .TRUE.
-                EXIT
-            END IF
+        RESID = SY_NEW / OMEGA - 1.0D0
+        if (ABS(RESID) <= TOL) exit
 
-            ! Compute derivatives for Newton-Raphson
-            dK_dDelta_gamma_matrix = 0.0D0
-            DO K7 = 1, 6
-                dK_dDelta_gamma_matrix(K7,K7) = -4.0D0*EG*Gamma(K7,K7)**2 &
-                    / (1.0D0 + 2.0D0*EG*d_ga*Gamma(K7,K7))**3
-            END DO
+        DOMEGA = 0.0D0
+        do I = 1, 6
+            if (GAMMA_EIG(I) > 1.0D-12) then
+                TEMP1(I) = -4.0D0*XMU*GAMMA_EIG(I)*KMAT(I) / &
+                    (1.0D0 + 2.0D0*XMU*DGAMMA*GAMMA_EIG(I))
+                DOMEGA = DOMEGA + 0.25D0/OMEGA * TEMP1(I) * STRESS_TILDE(I)**2
+            end if
+        end do
 
-            d_omega_d_d_gamma = (1.0D0 / (4.0D0 * omega)) &
-                * DOT_PRODUCT(s_tilde_tr, MATMUL(dK_dDelta_gamma_matrix, s_tilde_tr))
+        DSY_DGAMMA = 2.0D0 * DSYDA * (OMEGA + DGAMMA * DOMEGA)
+        DFY = DSY_DGAMMA/OMEGA - SY_NEW*DOMEGA/OMEGA**2
 
-            ! Chain rule: ∂σ_y/∂Δγ = (∂σ_y/∂α)·(∂α/∂Δγ)
-            d_sy_d_d_gamma = 2.0D0 * s_y_D * (omega + d_ga * d_omega_d_d_gamma)
+        if (ABS(DFY) > 1.0D-30) then
+            DGAMMA = DGAMMA - RESID / DFY
+        end if
+        DGAMMA = MAX(DGAMMA, 0.0D0)
+    end do
 
-            ! Derivative of residual
-            Df_gamma_d_d_gamma = (1.0D0 / omega) * d_sy_d_d_gamma &
-                - (s_y / (omega**2)) * d_omega_d_d_gamma
+    if (ITER > MAXITER) then
+        write(*,*) 'Hill48 return mapping did not converge.'
+        return
+    end if
 
-            ! Newton-Raphson update
-            d_ga = d_ga - f_gamma_delta / Df_gamma_d_d_gamma
+    !     Update stress
+    do I = 1, 6
+        if (GAMMA_EIG(I) > 1.0D-12) then
+            TEMP1(I) = STRESS_TILDE(I) / (1.0D0 + 2.0D0*XMU*DGAMMA*GAMMA_EIG(I))
+        else
+            TEMP1(I) = STRESS_TILDE(I)
+        end if
+    end do
 
-        END DO
+    call matvec6(QMAT, TEMP1, STRESS_DEV_NEW)
+    STRESS_DEV_NEW(4:6) = STRESS_DEV_NEW(4:6) / SQRT2
 
-        IF (.NOT. converged) THEN
-            WRITE(*,*) 'WARNING: Newton-Raphson did not converge!'
-            STATEV(9) = 1.0D0
-            PNEWDT = MIN(PNEWDT, 0.5D0)
-            RETURN
-        END IF
+    stress(1:3) = STRESS_DEV_NEW(1:3) + HYDRO
+    stress(4:6) = STRESS_DEV_NEW(4:6)
+end if
 
-        ! Update stress after Newton loop
-        Mat_inv = 0.0D0
-        DO K8 = 1, 6
-            Mat_inv(K8,K8) = 1.0D0 / (1.0D0 + 2.0D0*EG*d_ga*Gamma(K8,K8))
-        END DO
+!======================================================================
+!     Update state variables
+!     statev(1:6) = plastic strain components  (engineering shear)
+!     statev(7)   = alpha (equivalent plastic strain)
+!     statev(8)   = SY (current yield stress)
+!======================================================================
+statev(7) = ALPHA_NEW
+statev(8) = SY_NEW
 
-        dev_corrected = MATMUL(Q, MATMUL(Mat_inv, MATMUL(TRANSPOSE(Q), s_tr)))
+if (PLASTIC) then
+    TEMP2(1:3) = STRESS_DEV_NEW(1:3)
+    TEMP2(4:6) = STRESS_DEV_NEW(4:6) * SQRT2
 
-        ! Assemble full Cauchy stress
-        STRESS(1:3) = dev_corrected(1:3) + pressure
-        STRESS(4:6) = dev_corrected(4:6)
+    AMAT = 0.0D0
+    AMAT(1,1) = G + H;  AMAT(2,2) = F + H;  AMAT(3,3) = F + G
+    AMAT(1,2) = -H;  AMAT(2,1) = -H
+    AMAT(1,3) = -G;  AMAT(3,1) = -G
+    AMAT(2,3) = -F;  AMAT(3,2) = -F
+    AMAT(4,4) = XN;  AMAT(5,5) = XM;  AMAT(6,6) = XL
 
-        strain_p = strain_p + d_ga * MATMUL(MatM, dev_corrected)
-    END IF
+    call matvec6(AMAT, TEMP2, TEMP1)
+    ! Mandel flow component 4 is eps_p4 = Dgamma*N*sqrt(2)*sig12;
+    ! engineering shear gamma_p = sqrt(2)*eps_p4.
+    TEMP1(4:6) = TEMP1(4:6) * SQRT2
 
-    ! Update state variables
-    STATEV(1) = alpha                    ! Equivalent plastic strain
-    STATEV(2) = s_y                      ! Current yield stress
-    STATEV(3:8) = strain_p(1:6)         ! Plastic strain components
+    statev(1:6) = statev(1:6) + DGAMMA * TEMP1(1:6)
+end if
 
-    RETURN
+!======================================================================
+!     Tangent stiffness — consistent (algorithmic) tangent for GRR
+!
+!     C^alg = R · C^e_dev + β · n ⊗ q + (volumetric part of MatD)
+!
+!     Eigenspace linearization following Versino & Bennett (2018):
+!       R = T⁻¹ · Q · D⁻¹ · Q^T · T    (Mandel/Voigt mapping)
+!         D_inv(i) = 1/(1 + 2μ Δγ Γ_i)
+!       n_i = (T⁻¹ Q D⁻² Γ s̃)(i)       convert Mandel→Voigt: shear÷√2
+!       m_i = (T  Q K s̃/(2ω))(i)         convert Voigt←Mandel: shear×√2
+!       q   = C^e_dev · m
+!       β   = 2μ (DSYDA·2Δγ − 1) / (ω · DFY)
+!
+!     T scales shear slots by sqrt(2); its inverse scales by 1/sqrt(2).
+!     T maps physical stress to Mandel and Mandel strain to engineering strain.
+!
+!     Scratch usage (arrays re-used after stress update is done):
+!       TEMP1(6) = D_inv, TEMP2(6) = D_inv²
+!       AMAT(6,6)= R (after eigendecomp; refilled in statev block then reused here)
+!       GAMMA_EIG0(6,6) = intermediate scratch (C^e_dev, then Q·D_inv, ...)
+!       W(6)     = n_vec (Voigt)
+!       DSTRESS(6)= m_vec (Voigt)
+!       STRESS_DEV(6) = q_vec
+!     The stress / statev update above (lines up to 230) is UNCHANGED.
+!======================================================================
+if (PLASTIC) then
 
-    CONTAINS
+    !------------------------------------------------------------------
+    !  Recompute converged-state KMAT, OMEGA, DOMEGA, DFY (same
+    !  formulas as the N-R loop but evaluated once at the final DGAMMA).
+    !  Reference: hill48_umat.f:293-320
+    !------------------------------------------------------------------
+    do I = 1, 6
+        if (GAMMA_EIG(I) > 1.0D-12) then
+            KMAT(I) = GAMMA_EIG(I) / &
+                      (1.0D0 + 2.0D0*XMU*DGAMMA*GAMMA_EIG(I))**2
+        else
+            KMAT(I) = 0.0D0
+        end if
+    end do
 
-    !**********************************************************************
-    SUBROUTINE compute_eigendecomposition(A, W, Q, Gamma, INFO)
-        IMPLICIT NONE
-        INTEGER, INTENT(OUT) :: INFO
-        REAL(8), DIMENSION(6,6), INTENT(INOUT) :: A
-        REAL(8), DIMENSION(6), INTENT(OUT) :: W
-        REAL(8), DIMENSION(6,6), INTENT(OUT) :: Q
-        REAL(8), DIMENSION(6,6), INTENT(OUT) :: Gamma
-        INTEGER :: LWORK, i, j
-        REAL(8), DIMENSION(:), ALLOCATABLE :: WORK
-        LOGICAL :: is_symmetric
+    OMEGA = 0.0D0
+    do I = 1, 6
+        OMEGA = OMEGA + 0.5D0 * KMAT(I) * STRESS_TILDE(I)**2
+    end do
+    OMEGA = DSQRT(MAX(OMEGA, 1.0D-30))
 
-        ! Check symmetry
-        is_symmetric = .TRUE.
-        DO i = 1, 6
-            DO j = i + 1, 6
-                IF (ABS(A(i,j) - A(j,i)) > 1.0D-12) THEN
-                    is_symmetric = .FALSE.
-                    EXIT
-                END IF
-            END DO
-            IF (.NOT. is_symmetric) EXIT
-        END DO
+    DOMEGA = 0.0D0
+    do I = 1, 6
+        if (GAMMA_EIG(I) > 1.0D-12) then
+            TEMP1(I) = -4.0D0*XMU*GAMMA_EIG(I)*KMAT(I) / &
+                       (1.0D0 + 2.0D0*XMU*DGAMMA*GAMMA_EIG(I))
+            DOMEGA = DOMEGA + 0.25D0/OMEGA * TEMP1(I) * STRESS_TILDE(I)**2
+        end if
+    end do
+    DSY_DGAMMA = 2.0D0 * DSYDA * (OMEGA + DGAMMA * DOMEGA)
+    DFY = DSY_DGAMMA/OMEGA - SY_NEW*DOMEGA/OMEGA**2
 
-        IF (.NOT. is_symmetric) THEN
-            WRITE(*,*) "Error: Matrix not symmetric"
-            INFO = -1
-            RETURN
-        END IF
+    !------------------------------------------------------------------
+    !  Step 1: D_inv(I) = 1/(1+2μΔγΓ_i),  D_inv2(I) = D_inv(I)^2
+    !  Stored in TEMP1 and TEMP2 respectively.
+    !------------------------------------------------------------------
+    do I = 1, 6
+        if (GAMMA_EIG(I) > 1.0D-12) then
+            DENOM     = 1.0D0 + 2.0D0 * XMU * DGAMMA * GAMMA_EIG(I)
+            TEMP1(I)  = 1.0D0 / DENOM
+            TEMP2(I)  = TEMP1(I) * TEMP1(I)
+        else
+            TEMP1(I)  = 1.0D0
+            TEMP2(I)  = 1.0D0
+        end if
+    end do
 
-        ! LAPACK eigendecomposition
-        LWORK = -1
-        ALLOCATE(WORK(1))
-        CALL DSYEV('V', 'U', 6, A, 6, W, WORK, LWORK, INFO)
-        LWORK = INT(WORK(1))
-        DEALLOCATE(WORK)
-        ALLOCATE(WORK(LWORK))
+    !------------------------------------------------------------------
+    !  Step 2: Build R = T⁻¹ · (Q D_inv Q^T) · T
+    !  Use GAMMA_EIG0 as scratch (Mandel form first, then scaled).
+    !  (a) GAMMA_EIG0 = Q · diag(D_inv)  (scale cols of Q)
+    !  (b) AMAT = GAMMA_EIG0 · Q^T  (= Q D_inv Q^T in Mandel)
+    !  (c) Apply T⁻¹ (÷√2 on rows 4:6) and T (×√2 on cols 4:6)
+    !------------------------------------------------------------------
+    do I = 1, 6
+        do J = 1, 6
+            GAMMA_EIG0(I,J) = QMAT(I,J) * TEMP1(J)
+        end do
+    end do
+    AMAT = 0.0D0
+    do I = 1, 6
+        do J = 1, 6
+            do K = 1, 6
+                AMAT(I,J) = AMAT(I,J) + GAMMA_EIG0(I,K) * QMAT(J,K)
+            end do
+        end do
+    end do
+    !  T on cols 4:6 (×√2), T⁻¹ on rows 4:6 (÷√2) → net: T⁻¹·AMAT·T
+    do J = 4, 6
+        do I = 1, 6
+            AMAT(I,J) = AMAT(I,J) * SQRT2
+        end do
+    end do
+    do I = 4, 6
+        do J = 1, 6
+            AMAT(I,J) = AMAT(I,J) / SQRT2
+        end do
+    end do
+    !  AMAT now holds R in Voigt
 
-        CALL DSYEV('V', 'U', 6, A, 6, W, WORK, LWORK, INFO)
+    !------------------------------------------------------------------
+    !  Step 3: n = T⁻¹ · Q · (D_inv² · Γ · s̃_tr)
+    !  temp = D_inv2(I)*GAMMA_EIG(I)*STRESS_TILDE(I) in eigen-space
+    !  then back-transform: Q·temp (Mandel) then ÷√2 on shear
+    !  Result stored in W(6).
+    !------------------------------------------------------------------
+    do I = 1, 6
+        GAMMA_EIG0(I,1) = TEMP2(I) * GAMMA_EIG(I) * STRESS_TILDE(I)
+    end do
+    call matvec6(QMAT, GAMMA_EIG0(1:6,1), W)
+    W(4:6) = W(4:6) / SQRT2   ! Mandel→Voigt for shear
 
-        IF (INFO == 0) THEN
-            Q = A
-            Gamma = 0.0D0
-            DO i = 1, 6
-                Gamma(i,i) = W(i)
-            END DO
-        ELSE
-            WRITE(*,*) "Eigendecomposition failed, INFO:", INFO
-            Gamma = 0.0D0
-        END IF
+    !------------------------------------------------------------------
+    !  Step 4: m = (T · Q · K · s̃_tr) / (2ω)
+    !  temp = KMAT(I)*STRESS_TILDE(I) in eigen-space
+    !  then Q·temp (Mandel), ×√2 on shear, ÷(2ω)
+    !  Result stored in DSTRESS(6).
+    !------------------------------------------------------------------
+    do I = 1, 6
+        GAMMA_EIG0(I,1) = KMAT(I) * STRESS_TILDE(I)
+    end do
+    call matvec6(QMAT, GAMMA_EIG0(1:6,1), DSTRESS)
+    DSTRESS(1:3) = DSTRESS(1:3)          / (2.0D0 * OMEGA)
+    DSTRESS(4:6) = DSTRESS(4:6) * SQRT2  / (2.0D0 * OMEGA)
 
-        DEALLOCATE(WORK)
+    !------------------------------------------------------------------
+    !  Step 5: C^e_dev = MatD − vol projection
+    !  Use GAMMA_EIG0 as C^e_dev (overwrite all 6 cols).
+    !------------------------------------------------------------------
+    do I = 1, 6
+        do J = 1, 6
+            GAMMA_EIG0(I,J) = MatD(I,J)
+        end do
+    end do
+    do J = 1, 6
+        HYDRO = (MatD(1,J) + MatD(2,J) + MatD(3,J)) / 3.0D0
+        do I = 1, 3
+            GAMMA_EIG0(I,J) = GAMMA_EIG0(I,J) - HYDRO
+        end do
+    end do
 
-    END SUBROUTINE compute_eigendecomposition
+    !------------------------------------------------------------------
+    !  Step 6: q = C^e_dev · m  (store in STRESS_DEV)
+    !------------------------------------------------------------------
+    call matvec6(GAMMA_EIG0, DSTRESS, STRESS_DEV)
 
-END SUBROUTINE UMAT
-!*****************************BOTTOM*****************************
+    !------------------------------------------------------------------
+    !  Step 7: β = 2μ (DSYDA·2Δγ − 1) / (ω · DFY)
+    !  Stored in DENOM (scalar).
+    !------------------------------------------------------------------
+    if (ABS(DFY) > 1.0D-30) then
+        DENOM = 2.0D0 * XMU * (DSYDA * 2.0D0 * DGAMMA - 1.0D0) / &
+                (OMEGA * DFY)
+    else
+        DENOM = 0.0D0
+    end if
+
+    !------------------------------------------------------------------
+    !  Step 8: C^alg = R·C^e_dev + β·n⊗q + volumetric
+    !  (a) ddsdde = R · C^e_dev   (R=AMAT, C^e_dev=GAMMA_EIG0)
+    !  (b) ddsdde += β · n(=W) ⊗ q(=STRESS_DEV)
+    !  (c) ddsdde += volumetric col contributions
+    !------------------------------------------------------------------
+    ddsdde = 0.0D0
+    do I = 1, 6
+        do J = 1, 6
+            do K = 1, 6
+                ddsdde(I,J) = ddsdde(I,J) + AMAT(I,K) * GAMMA_EIG0(K,J)
+            end do
+        end do
+    end do
+
+    do I = 1, 6
+        do J = 1, 6
+            ddsdde(I,J) = ddsdde(I,J) + DENOM * W(I) * STRESS_DEV(J)
+        end do
+    end do
+
+    do J = 1, 6
+        HYDRO = (MatD(1,J) + MatD(2,J) + MatD(3,J)) / 3.0D0
+        do I = 1, 3
+            ddsdde(I,J) = ddsdde(I,J) + HYDRO
+        end do
+    end do
+
+else
+    ddsdde = MatD
+end if
+
+success = .true.
+end subroutine hill48_update
+
+subroutine voce_hard(alpha, sy0, qinf, b, sy, dsyda)
+implicit none
+real(8), intent(in) :: alpha, sy0, qinf, b
+real(8), intent(out) :: sy, dsyda
+real(8) :: ex
+ex = exp(-b * alpha)
+sy = sy0 + qinf * (1.0D0 - ex)
+dsyda = qinf * b * ex
+end subroutine voce_hard
+
+!======================================================================
+subroutine compute_eigen_GRR(A, W, Q, Gamma, INFO)
+implicit none
+real(8), intent(inout) :: A(6,6)
+real(8), intent(out) :: W(6), Q(6,6), Gamma(6,6)
+integer, intent(out) :: INFO
+real(8), allocatable :: WORK(:)
+integer :: LWORK, i
+
+LWORK = -1
+allocate(WORK(1))
+call DSYEV('V', 'U', 6, A, 6, W, WORK, LWORK, INFO)
+if (INFO /= 0) return
+LWORK = INT(WORK(1))
+deallocate(WORK)
+allocate(WORK(LWORK))
+call DSYEV('V', 'U', 6, A, 6, W, WORK, LWORK, INFO)
+
+if (INFO /= 0) return
+Q = A
+Gamma = 0.0D0
+do i = 1, 6
+    Gamma(i,i) = W(i)
+end do
+deallocate(WORK)
+end subroutine compute_eigen_GRR
+
+!======================================================================
+subroutine matvec6(A, X, Y)
+implicit none
+real(8), intent(in) :: A(6,6), X(6)
+real(8), intent(out) :: Y(6)
+integer :: i
+do i = 1, 6
+    Y(i) = sum(A(i,:) * X(:))
+end do
+end subroutine matvec6
+
+!======================================================================
+subroutine matvec6_T(A, X, Y)
+implicit none
+real(8), intent(in) :: A(6,6), X(6)
+real(8), intent(out) :: Y(6)
+integer :: i
+do i = 1, 6
+    Y(i) = sum(A(:,i) * X(:))
+end do
+end subroutine matvec6_T
+
+end subroutine UMAT
