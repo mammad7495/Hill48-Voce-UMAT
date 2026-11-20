@@ -61,13 +61,15 @@ In your Abaqus input file:
 
 Compile and link:
 ```bash
-abaqus job=myJob user=Hill48.f
+abaqus job=myJob user=Hill48.f90
 ```
 
 ## Notes
 
 - 3D only (NTENS=6). For plane stress/strain, a wrapper or modification is needed.
-- The tangent `DDSDDE` currently returns the elastic stiffness (or a scaled approximation), not the fully consistent algorithmic tangent. This is sufficient for explicit or modified Newton solvers but may slow convergence with full Newton-Raphson at the global level.
+- The Abaqus/Standard material Jacobian `DDSDDE` is the elastic stiffness, including after yielding. This approximation can slow global Newton convergence.
+- If the eigensolve or plastic iteration fails, the UMAT requests a smaller increment through `PNEWDT`. Abaqus/Standard needs automatic incrementation to retry.
+- The stored plastic strain components have no explicit `DROT` transport in this implementation. Check material-axis and state-output conventions before using it for large-rotation histories.
 - LAPACK's `DSYEV` routine is required for eigendecomposition. Link against Intel MKL or equivalent.
 
 ## Reference
