@@ -12,6 +12,27 @@ The implementation follows the GRR approach of Versino & Bennett (2018), which:
 
 This avoids the 6x6 matrix inversion per iteration required by standard implicit Hill48 return-mapping algorithms.
 
+The Hill48 equivalent stress is defined by
+
+$$
+\sigma_{\mathrm{eq}}^2 =
+F(\sigma_{22}-\sigma_{33})^2 +
+G(\sigma_{33}-\sigma_{11})^2 +
+H(\sigma_{11}-\sigma_{22})^2 +
+2L\sigma_{23}^2 + 2M\sigma_{13}^2 + 2N\sigma_{12}^2.
+$$
+
+Yield occurs when the equivalent stress reaches the current Voce yield stress.
+Associated flow uses the Hill48 yield surface to determine the plastic strain increment.
+
+## Shear convention
+
+Abaqus supplies physical shear stress components and engineering shear strain increments in the order
+`11, 22, 33, 12, 13, 23`. The return map multiplies the trial shear stresses by √2 to work in
+Mandel coordinates. It divides the corrected shear stresses by √2 on return and stores plastic
+shear strains in engineering form. With all Hill coefficients set to the isotropic values in the
+example below, the yield function reduces to von Mises.
+
 ## Hardening Law
 
 **Voce isotropic hardening:**
@@ -59,16 +80,20 @@ In your Abaqus input file:
  1.5,   1.5,  1.5
 ```
 
-Compile and link:
+Save `Hill48.f90` alongside your Abaqus input deck. The file contains the UMAT, return mapping, and tangent calculation. It requires Abaqus/Standard, a supported Fortran compiler, and LAPACK. Submit the job with:
 ```bash
-abaqus job=myJob user=Hill48.f
+abaqus job=myJob user=Hill48.f90
 ```
 
 ## Notes
 
-- 3D only (NTENS=6). For plane stress/strain, a wrapper or modification is needed.
-- The tangent `DDSDDE` currently returns the elastic stiffness (or a scaled approximation), not the fully consistent algorithmic tangent. This is sufficient for explicit or modified Newton solvers but may slow convergence with full Newton-Raphson at the global level.
+- Full three-dimensional stress only (`NDI=3`, `NSHR=3`, `NTENS=6`). Plane stress and plane strain require a separate implementation.
+- The UMAT returns the elastic tangent before yield and the algorithmic GRR tangent for plastic increments.
+- If the eigensolve or plastic iteration fails, the UMAT requests a smaller increment through `PNEWDT`. Abaqus/Standard needs automatic incrementation to retry.
+- The stored plastic strain components have no explicit `DROT` transport in this implementation. Check material-axis and state-output conventions before using it for large-rotation histories.
 - LAPACK's `DSYEV` routine is required for eigendecomposition. Link against Intel MKL or equivalent.
+
+The standalone wrapper changes have been reviewed in source. They have not been run in Abaqus.
 
 ## Reference
 
